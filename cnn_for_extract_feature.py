@@ -160,27 +160,32 @@ class TabularCNNNetwork(nn.Module):
     def count_parameters(self):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
-    def get_embedding(self, x):
-        with torch.no_grad():
-            batch_size = x.size(0)
-            
-            # Tabular embedding
-            embedded = self.tabular_embed(x)
-            
-            # Sequence projection
-            projected = self.feature_projection(embedded)
-            seq = projected.view(batch_size, self.seq_length, -1)
-            seq = seq.transpose(1, 2)
-            
-            # CNN
-            conv1_out = F.relu(self.bn1(self.conv1(seq)))
-            conv2_out = F.relu(self.bn2(self.conv2(conv1_out)))
-            
-            # Attention pooling
-            pooled, _ = self.attention_pool(conv2_out)
-            
-            # Bilinear
-            embedding = self.low_rank_bilinear(pooled, pooled)
-            embedding = F.relu(embedding)
-            
+    def compute_embedding(self, x: torch.Tensor) -> torch.Tensor:
+        batch_size = x.size(0)
+
+        # Tabular embedding
+        embedded = self.tabular_embed(x)
+
+        # Sequence projection
+        projected = self.feature_projection(embedded)
+        seq = projected.view(batch_size, self.seq_length, -1)
+        seq = seq.transpose(1, 2)
+
+        # CNN
+        conv1_out = F.relu(self.bn1(self.conv1(seq)))
+        conv2_out = F.relu(self.bn2(self.conv2(conv1_out)))
+
+        # Attention pooling
+        pooled, _ = self.attention_pool(conv2_out)
+
+        # Bilinear
+        embedding = self.low_rank_bilinear(pooled, pooled)
+        embedding = F.relu(embedding)
+
         return embedding
+
+    def get_embedding(self, x: torch.Tensor, detach: bool = True) -> torch.Tensor:
+        if detach:
+            with torch.no_grad():
+                return self.compute_embedding(x)
+        return self.compute_embedding(x)
