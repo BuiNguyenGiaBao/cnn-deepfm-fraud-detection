@@ -45,4 +45,4 @@ class HybridCNNDeepFM(nn.Module):
     def get_attention_weights(self, x: torch.Tensor) -> torch.Tensor:
         return self.cnn.get_attention_weights(x)            
     
-class dataset    
+    

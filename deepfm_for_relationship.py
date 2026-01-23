@@ -59,19 +59,19 @@ class DeepFM(nn.Module):
         self.embed_dim = int(embed_dim)
         self.dense_in_dim = dense_in_dim
 
-        # ----- Linear part -----
+        # Linear part 
         self.linear_cat = nn.ModuleList([nn.Embedding(card, 1) for card in self.categorical_cardinalities])
         self.linear_num = nn.Linear(self.num_num, 1, bias=False) if self.num_num > 0 else None
         self.linear_dense = nn.Linear(self.dense_in_dim, 1, bias=False) if self.dense_in_dim is not None else None
         self.linear_bias = nn.Parameter(torch.zeros(1)) if use_bias else None
 
-        # ----- FM part -----
+        # FM part 
         self.fm = FactorizationMachine()
         self.fm_cat_emb = nn.ModuleList([nn.Embedding(card, self.embed_dim) for card in self.categorical_cardinalities])
         self.fm_num_emb = nn.Parameter(torch.randn(self.num_num, self.embed_dim) * 0.01) if self.num_num > 0 else None
         self.fm_dense_proj = nn.Linear(self.dense_in_dim, self.embed_dim, bias=False) if self.dense_in_dim is not None else None
 
-        # ----- Deep part -----
+        # Deep part 
         deep_in = self.embed_dim * (self.num_cat + self.num_num + (1 if self.dense_in_dim is not None else 0))
         self.mlp = MLP(deep_in, deep_hidden, dropout=dropout)
         deep_out_dim = 1 if self.num_classes == 2 else self.num_classes
