@@ -1,0 +1,11 @@
+deepfm
+
+Dữ liệu bảng
+   ↓
+Feature selection / normalization
+   ↓
+Tree-based model (XGBoost / RF)
+   ↓
+Rule extraction / SHAP
+   ↓
+Giải thích + báo cáo
