@@ -96,7 +96,6 @@ class IEEEFraudDataset(Dataset):
 
 class Trainer:
     """Training and evaluation for Hybrid CNN-DeepFM model"""
-    
     def __init__(
         self,
         model: HybridCNNDeepFM,
