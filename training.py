@@ -3,69 +3,100 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 import numpy as np
-from typing import Optional,  Dict
+from typing import Optional, Dict, Tuple
 from tqdm import tqdm
 from cnn_for_extract_feature import TabularCNNNetwork
 from deepfm_for_relationship import DeepFM
-from torch.utils.data import Dataset
 import argparse
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import (
+    roc_auc_score, accuracy_score, precision_score, 
+    recall_score, f1_score, confusion_matrix, 
+    classification_report, roc_curve, auc
+)
+import matplotlib.pyplot as plt
+import seaborn as sns
+from pathlib import Path
 
 
 class HybridCNNDeepFM(nn.Module):
-    def __init__(self,tabular_dim: int, 
-                #cnn        
-                embed_dim = 64,
-                conv_channels = 128,
-                kernel_size = 3,
-                bilinear_rank = 64,
-                bilinear_out_dim= 256,
-                seq_length= 10,
-                cnn_dropout = 0.3,
+    """Hybrid CNN-DeepFM model for fraud detection"""
+    def __init__(self, tabular_dim: int, 
+                # CNN        
+                embed_dim=64,
+                conv_channels=128,
+                kernel_size=3,
+                bilinear_rank=64,
+                bilinear_out_dim=256,
+                seq_length=10,
+                cnn_dropout=0.3,
                 # DeepFM params
-                num_classes: int = 2,
-                deepfm_embed_dim: int = 16,
+                num_classes: int=2,
+                deepfm_embed_dim: int=16,
                 deepfm_hidden=None,
-                deepfm_dropout: float = 0.2,
+                deepfm_dropout: float=0.2,
                 # Training mode
-                freeze_cnn: bool = False,):
+                freeze_cnn: bool=False):
         super().__init__()
         self.num_classes = num_classes
         self.freeze_cnn = freeze_cnn
 
-        self.cnn = TabularCNNNetwork(tabular_dim=tabular_dim,embed_dim=embed_dim,conv_channels=conv_channels,
-            kernel_size=kernel_size,bilinear_rank=bilinear_rank,bilinear_out_dim=bilinear_out_dim,num_classes=num_classes, seq_length=seq_length,dropout=cnn_dropout)
+        # CNN Feature Extractor
+        self.cnn = TabularCNNNetwork(
+            tabular_dim=tabular_dim,
+            embed_dim=embed_dim,
+            conv_channels=conv_channels,
+            kernel_size=kernel_size,
+            bilinear_rank=bilinear_rank,
+            bilinear_out_dim=bilinear_out_dim,
+            num_classes=num_classes,
+            seq_length=seq_length,
+            dropout=cnn_dropout
+        )
 
+        # DeepFM for relationship learning
         deepfm_hidden = deepfm_hidden or [256, 128, 64]
-        self.deepfm = DeepFM(num_classes=num_classes,categorical_cardinalities=None,num_numerical=0,embed_dim=deepfm_embed_dim,
-            deep_hidden=deepfm_hidden,dropout=deepfm_dropout,dense_in_dim=bilinear_out_dim,use_bias=True,)
+        self.deepfm = DeepFM(
+            num_classes=num_classes,
+            categorical_cardinalities=None,
+            num_numerical=0,
+            embed_dim=deepfm_embed_dim,
+            deep_hidden=deepfm_hidden,
+            dropout=deepfm_dropout,
+            dense_in_dim=bilinear_out_dim,
+            use_bias=True
+        )
 
         if freeze_cnn:
             for p in self.cnn.parameters():
                 p.requires_grad = False
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: CNN Feature Extract -> DeepFM Classification"""
         cnn_features = self.cnn.get_embedding(x, detach=self.freeze_cnn)
         logits = self.deepfm(dense_x=cnn_features)
         return logits
 
     def extract_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Extract CNN features only"""
         return self.cnn.get_embedding(x, detach=True)
 
     def get_attention_weights(self, x: torch.Tensor) -> torch.Tensor:
-        return self.cnn.get_attention_weights(x)            
+        """Get attention weights from CNN"""
+        return self.cnn.get_attention_weights(x)
 
-
-from torch.utils.data import Dataset
 
 class IEEEFraudDataset(Dataset):
-    """Dataset for IEEE-CIS Fraud Detection (preprocessed CSV files)"""
-    def __init__(self, csv_path: str, target_col: str = 'isFraud'):
+    """Dataset for IEEE-CIS Fraud Detection"""
+    def __init__(self, csv_path: str, target_col: str='isFraud', normalize: bool=False):
         print(f"Loading data from {csv_path}...")
         df = pd.read_csv(csv_path)
 
+        # Handle infinite and missing values
         df = df.replace([np.inf, -np.inf], np.nan)
         df = df.fillna(0.0)
+        
+        # Load features and target
         if target_col in df.columns:
             self.y = torch.FloatTensor(df[target_col].values)
             self.X = torch.FloatTensor(df.drop(columns=[target_col]).values)
@@ -75,14 +106,25 @@ class IEEEFraudDataset(Dataset):
             self.y = None
             self.has_target = False
 
+        # Store feature names
         self.feature_names = (
             df.drop(columns=[target_col]).columns.tolist()
             if self.has_target else df.columns.tolist()
         )
 
+        # Normalize features if requested
+        if normalize and self.X.shape[0] > 0:
+            mean = self.X.mean(dim=0)
+            std = self.X.std(dim=0)
+            std[std == 0] = 1.0  # Avoid division by zero
+            self.X = (self.X - mean) / std
+
         print(f"✓ Loaded {len(self.X)} samples with {self.X.shape[1]} features")
         if self.has_target:
             fraud_ratio = self.y.mean().item()
+            n_fraud = int(self.y.sum().item())
+            n_normal = len(self.y) - n_fraud
+            print(f"✓ Class distribution: Normal={n_normal}, Fraud={n_fraud}")
             print(f"✓ Fraud ratio: {fraud_ratio*100:.2f}%")
 
     def __len__(self):
@@ -94,15 +136,16 @@ class IEEEFraudDataset(Dataset):
         else:
             return self.X[idx]
 
-class Trainer:
-    """Training and evaluation for Hybrid CNN-DeepFM model"""
+
+class FraudDetectionTrainer:
+    """Trainer for Fraud Detection Classification"""
     def __init__(
         self,
         model: HybridCNNDeepFM,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-        learning_rate: float = 1e-3,
-        weight_decay: float = 1e-5,
-        pos_weight: Optional[float] = None,  # For imbalanced data
+        device: str='cuda' if torch.cuda.is_available() else 'cpu',
+        learning_rate: float=1e-3,
+        weight_decay: float=1e-5,
+        pos_weight: Optional[float]=None,
     ):
         self.model = model.to(device)
         self.device = device
@@ -113,155 +156,206 @@ class Trainer:
             weight_decay=weight_decay
         )
         
-        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer,mode='min',factor=0.5,patience=5,verbose=True)
+        self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5,
+            verbose=True
+        )
         
-        # Loss function based on num_classes
-        if model.num_classes == 2:
-            if pos_weight is not None:
-                # Handle class imbalance
-                pos_weight_tensor = torch.tensor([pos_weight]).to(device)
-                self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
-                print(f"Using pos_weight={pos_weight:.2f} for imbalanced classes")
-            else:
-                self.criterion = nn.BCEWithLogitsLoss()
+        # Loss function with pos_weight for imbalanced data
+        if pos_weight is not None:
+            pos_weight_tensor = torch.tensor([pos_weight]).to(device)
+            self.criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
+            print(f"✓ Using BCEWithLogitsLoss with pos_weight={pos_weight:.2f}")
         else:
-            self.criterion = nn.CrossEntropyLoss()
+            self.criterion = nn.BCEWithLogitsLoss()
+            print(f"✓ Using BCEWithLogitsLoss (balanced)")
     
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
-        """Train for one epoch"""
+        """Train one epoch"""
         self.model.train()
-        total_loss = 0
-        correct = 0
-        total = 0
-        
+
+        total_loss = 0.0
+        all_preds = []
+        all_probs = []
+        all_labels = []
+
         pbar = tqdm(train_loader, desc='Training')
         for batch_x, batch_y in pbar:
             batch_x = batch_x.to(self.device)
-            batch_y = batch_y.to(self.device)
-            
-            # Forward pass
-            logits = self.model(batch_x)
-            
-            # Compute loss
-            if self.model.num_classes == 2:
-                logits = torch.clamp(logits, min=-20, max=20)
-                loss = self.criterion(logits.view(-1), batch_y.float())
+            batch_y = batch_y.to(self.device).float()
 
-                preds = (torch.sigmoid(logits) > 0.5).long().view(-1)
-            else:
-                loss = self.criterion(logits, batch_y)
-                preds = torch.argmax(logits, dim=1)
-            
+            # Forward pass
+            logits = self.model(batch_x).view(-1)
+            probs = torch.sigmoid(logits)
+
+            # Compute loss
+            loss = self.criterion(logits, batch_y)
+
             # Backward pass
             self.optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
             self.optimizer.step()
+
+            # Store predictions
+            preds = (probs > 0.5).long()
+            all_preds.extend(preds.cpu().detach().numpy())
+            all_probs.extend(probs.cpu().detach().numpy())
+            all_labels.extend(batch_y.cpu().detach().numpy())
             
-            # Metrics
             total_loss += loss.item()
-            correct += (preds == batch_y).sum().item()
-            total += batch_y.size(0)
-            
-            pbar.set_postfix({
-                'loss': f'{loss.item():.4f}',
-                'acc': f'{100.0 * correct / total:.2f}%'
-            })
+
+            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+
+        # Calculate metrics
+        all_preds = np.array(all_preds)
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
         
-        return {
+        metrics = {
             'loss': total_loss / len(train_loader),
-            'accuracy': 100.0 * correct / total
+            'accuracy': accuracy_score(all_labels, all_preds),
+            'precision': precision_score(all_labels, all_preds, zero_division=0),
+            'recall': recall_score(all_labels, all_preds, zero_division=0),
+            'f1': f1_score(all_labels, all_preds, zero_division=0),
         }
-    
+        
+        # Calculate AUC
+        try:
+            metrics['auc'] = roc_auc_score(all_labels, all_probs)
+        except:
+            metrics['auc'] = 0.0
+                
+        return metrics
+
     @torch.no_grad()
     def evaluate(self, val_loader: DataLoader) -> Dict[str, float]:
         """Evaluate on validation set"""
         self.model.eval()
-        
-        total_loss = 0
-        correct = 0
-        total = 0
-        
+
+        total_loss = 0.0
+        all_preds = []
+        all_probs = []
+        all_labels = []
+
         for batch_x, batch_y in val_loader:
             batch_x = batch_x.to(self.device)
-            batch_y = batch_y.to(self.device)
-            
-            # Forward pass
-            logits = self.model(batch_x)
-            
-            # Compute loss
-            if self.model.num_classes == 2:
-                logits = torch.clamp(logits, min=-20, max=20)
-                loss = self.criterion(logits.view(-1), batch_y.float())
+            batch_y = batch_y.to(self.device).float()
 
-                preds = (torch.sigmoid(logits) > 0.5).long().view(-1)
-            else:
-                loss = self.criterion(logits, batch_y)
-                preds = torch.argmax(logits, dim=1)
-            
-            # Metrics
+            logits = self.model(batch_x).view(-1)
+            probs = torch.sigmoid(logits)
+            loss = self.criterion(logits, batch_y)
+
             total_loss += loss.item()
-            correct += (preds == batch_y).sum().item()
-            total += batch_y.size(0)
+            
+            # Store predictions
+            preds = (probs > 0.5).long()
+            all_preds.extend(preds.cpu().detach().numpy())
+            all_probs.extend(probs.cpu().detach().numpy())
+            all_labels.extend(batch_y.cpu().detach().numpy())
+
+        all_preds = np.array(all_preds)
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
         
-        return {'loss': total_loss / len(val_loader),'accuracy': 100.0 * correct / total}
-    
+        metrics = {
+            'loss': total_loss / len(val_loader),
+            'accuracy': accuracy_score(all_labels, all_preds),
+            'precision': precision_score(all_labels, all_preds, zero_division=0),
+            'recall': recall_score(all_labels, all_preds, zero_division=0),
+            'f1': f1_score(all_labels, all_preds, zero_division=0),
+        }
+        
+        # Calculate AUC
+        try:
+            metrics['auc'] = roc_auc_score(all_labels, all_probs)
+        except:
+            metrics['auc'] = 0.0
+        
+        return metrics
+
     def fit(
         self,
         train_loader: DataLoader,
         val_loader: DataLoader,
-        epochs: int = 100,
-        early_stopping_patience: int = 10,
-        save_path: Optional[str] = None,
+        epochs: int=100,
+        early_stopping_patience: int=10,
+        save_path: Optional[str]=None,
     ):
         """Full training loop with early stopping"""
-        best_val_loss = float('inf')
+
+        best_val_auc = 0.0
         patience_counter = 0
-        
-        history = {'train_loss': [],'train_acc': [],'val_loss': [],'val_acc': []}
-        
+
+        history = {
+            'train_loss': [], 'train_accuracy': [], 'train_precision': [], 
+            'train_recall': [], 'train_f1': [], 'train_auc': [],
+            'val_loss': [], 'val_accuracy': [], 'val_precision': [], 
+            'val_recall': [], 'val_f1': [], 'val_auc': []
+        }
+
         for epoch in range(epochs):
-            print(f'\nEpoch {epoch+1}/{epochs}')
-            print('-' * 50)
-            
-            # Train
+            print(f'\n{"="*70}')
+            print(f'Epoch {epoch+1}/{epochs}')
+            print(f'{"="*70}')
+
+            # Train and validate
             train_metrics = self.train_epoch(train_loader)
-            
-            # Validate
             val_metrics = self.evaluate(val_loader)
-            
+
             # Learning rate scheduling
             self.scheduler.step(val_metrics['loss'])
-            
-            # Store history
-            history['train_loss'].append(train_metrics['loss'])
-            history['train_acc'].append(train_metrics['accuracy'])
-            history['val_loss'].append(val_metrics['loss'])
-            history['val_acc'].append(val_metrics['accuracy'])
-            
-            print(f"Train Loss: {train_metrics['loss']:.4f} | Train Acc: {train_metrics['accuracy']:.2f}%")
-            print(f"Val Loss: {val_metrics['loss']:.4f} | Val Acc: {val_metrics['accuracy']:.2f}%")
-            
-            # Early stopping
-            if val_metrics['loss'] < best_val_loss:
-                best_val_loss = val_metrics['loss']
+
+            # Save history
+            for metric in ['loss', 'accuracy', 'precision', 'recall', 'f1', 'auc']:
+                history[f'train_{metric}'].append(train_metrics.get(metric, 0.0))
+                history[f'val_{metric}'].append(val_metrics.get(metric, 0.0))
+
+            # Logging
+            print(f"\nTrain Metrics:")
+            print(f"  Loss: {train_metrics['loss']:.4f} | Acc: {train_metrics['accuracy']:.4f} | "
+                  f"Prec: {train_metrics['precision']:.4f} | Rec: {train_metrics['recall']:.4f}")
+            print(f"  F1: {train_metrics['f1']:.4f} | AUC: {train_metrics['auc']:.4f}")
+
+            print(f"\nValidation Metrics:")
+            print(f"  Loss: {val_metrics['loss']:.4f} | Acc: {val_metrics['accuracy']:.4f} | "
+                  f"Prec: {val_metrics['precision']:.4f} | Rec: {val_metrics['recall']:.4f}")
+            print(f"  F1: {val_metrics['f1']:.4f} | AUC: {val_metrics['auc']:.4f}")
+
+            # Early stopping based on AUC
+            if val_metrics['auc'] > best_val_auc:
+                best_val_auc = val_metrics['auc']
                 patience_counter = 0
-                
-                # Save best model
+
                 if save_path:
-                    torch.save({'epoch': epoch,'model_state_dict': self.model.state_dict(),'optimizer_state_dict': self.optimizer.state_dict(),
-                        'val_loss': best_val_loss,'val_acc': val_metrics['accuracy'],}, save_path)
-                    print(f"✓ Model saved to {save_path}")
+                    torch.save(
+                        {
+                            'epoch': epoch,
+                            'model_state_dict': self.model.state_dict(),
+                            'optimizer_state_dict': self.optimizer.state_dict(),
+                            'val_loss': val_metrics['loss'],
+                            'val_accuracy': val_metrics['accuracy'],
+                            'val_precision': val_metrics['precision'],
+                            'val_recall': val_metrics['recall'],
+                            'val_f1': val_metrics['f1'],
+                            'val_auc': val_metrics['auc'],
+                        },
+                        save_path
+                    )
+                    print(f"\n✓ Best model saved! (AUC: {best_val_auc:.4f})")
             else:
                 patience_counter += 1
                 if patience_counter >= early_stopping_patience:
-                    print(f"\nEarly stopping triggered after {epoch+1} epochs")
+                    print(f"\n⛔ Early stopping triggered after {epoch+1} epochs")
                     break
-        
+
         return history
     
     @torch.no_grad()
-    def predict(self, test_loader: DataLoader, return_proba: bool = False) -> np.ndarray:
+    def predict(self, test_loader: DataLoader) -> Tuple[np.ndarray, np.ndarray]:
         """Make predictions on test set"""
         self.model.eval()
         
@@ -277,90 +371,179 @@ class Trainer:
             batch_x = batch_x.to(self.device)
             
             # Forward pass
-            logits = self.model(batch_x)
-            
-            if self.model.num_classes == 2:
-                probs = torch.sigmoid(logits).view(-1)
-                preds = (probs > 0.5).long()
-                all_probs.append(probs.cpu().numpy())
-            else:
-                probs = F.softmax(logits, dim=1)
-                preds = torch.argmax(logits, dim=1)
-                all_probs.append(probs.cpu().numpy())
+            logits = self.model(batch_x).view(-1)
+            probs = torch.sigmoid(logits)
+            preds = (probs > 0.5).long()
             
             all_preds.append(preds.cpu().numpy())
+            all_probs.append(probs.cpu().numpy())
         
         predictions = np.concatenate(all_preds)
         probabilities = np.concatenate(all_probs)
         
-        if return_proba:
-            return probabilities
-        return predictions
+        return predictions, probabilities
     
     def load_checkpoint(self, checkpoint_path: str):
         """Load model from checkpoint"""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.model.load_state_dict(checkpoint['model_state_dict'])
         self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
-        print(f"Val Loss: {checkpoint['val_loss']:.4f} | Val Acc: {checkpoint['val_acc']:.2f}%")
+        
+        print(f"\n✓ Checkpoint loaded from epoch {checkpoint['epoch']}")
+        print(f"  Val Loss: {checkpoint['val_loss']:.4f}")
+        print(f"  Val AUC: {checkpoint['val_auc']:.4f}")
+        print(f"  Val F1: {checkpoint['val_f1']:.4f}")
+
+    def save_best_metrics(self, val_loader: DataLoader, save_dir: str='./results'):
+        """Save detailed evaluation metrics and plots"""
+        Path(save_dir).mkdir(parents=True, exist_ok=True)
+        
+        self.model.eval()
+        all_preds = []
+        all_probs = []
+        all_labels = []
+
+        with torch.no_grad():
+            for batch_x, batch_y in val_loader:
+                batch_x = batch_x.to(self.device)
+                logits = self.model(batch_x).view(-1)
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).long()
+                
+                all_preds.extend(preds.cpu().numpy())
+                all_probs.extend(probs.cpu().numpy())
+                all_labels.extend(batch_y.cpu().numpy())
+
+        all_preds = np.array(all_preds)
+        all_probs = np.array(all_probs)
+        all_labels = np.array(all_labels)
+
+        # Generate classification report
+        report = classification_report(all_labels, all_preds, 
+                                      target_names=['Normal', 'Fraud'])
+        print("\n" + "="*60)
+        print("CLASSIFICATION REPORT")
+        print("="*60)
+        print(report)
+
+        # Save report
+        with open(f'{save_dir}/classification_report.txt', 'w') as f:
+            f.write(report)
+
+        # Confusion matrix
+        cm = confusion_matrix(all_labels, all_preds)
+        
+        fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+        
+        # Plot 1: Confusion Matrix
+        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=axes[0],
+                   xticklabels=['Normal', 'Fraud'],
+                   yticklabels=['Normal', 'Fraud'])
+        axes[0].set_title('Confusion Matrix')
+        axes[0].set_ylabel('True Label')
+        axes[0].set_xlabel('Predicted Label')
+
+        # Plot 2: ROC Curve
+        fpr, tpr, _ = roc_curve(all_labels, all_probs)
+        roc_auc = auc(fpr, tpr)
+        axes[1].plot(fpr, tpr, color='darkorange', lw=2, 
+                    label=f'ROC curve (AUC = {roc_auc:.4f})')
+        axes[1].plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
+        axes[1].set_xlim([0.0, 1.0])
+        axes[1].set_ylim([0.0, 1.05])
+        axes[1].set_xlabel('False Positive Rate')
+        axes[1].set_ylabel('True Positive Rate')
+        axes[1].set_title('ROC Curve')
+        axes[1].legend(loc="lower right")
+
+        plt.tight_layout()
+        plt.savefig(f'{save_dir}/evaluation_metrics.png', dpi=300, bbox_inches='tight')
+        print(f"\n✓ Metrics saved to {save_dir}/")
 
 
-def create_synthetic_data(n_samples: int = 10000, n_features: int = 50, n_classes: int = 2):
-    """Create synthetic dataset for testing"""
-    X = np.random.randn(n_samples, n_features).astype(np.float32)
+def plot_training_history(history: Dict, save_dir: str='./results'):
+    """Plot training history"""
+    Path(save_dir).mkdir(parents=True, exist_ok=True)
     
-    # Create target based on some pattern
-    if n_classes == 2:
-        y = ((X[:, :5].sum(axis=1) + np.random.randn(n_samples) * 0.5) > 0).astype(np.int64)
-    else:
-        y = np.random.randint(0, n_classes, n_samples)
+    fig, axes = plt.subplots(2, 3, figsize=(16, 8))
     
-    return X, y
+    metrics = ['loss', 'accuracy', 'precision', 'recall', 'f1', 'auc']
+    
+    for idx, metric in enumerate(metrics):
+        row, col = idx // 3, idx % 3
+        
+        train_key = f'train_{metric}'
+        val_key = f'val_{metric}'
+        
+        if train_key in history and val_key in history:
+            axes[row, col].plot(history[train_key], label=f'Train {metric}', marker='o')
+            axes[row, col].plot(history[val_key], label=f'Val {metric}', marker='s')
+            axes[row, col].set_title(f'{metric.upper()}')
+            axes[row, col].set_xlabel('Epoch')
+            axes[row, col].set_ylabel(metric.upper())
+            axes[row, col].legend()
+            axes[row, col].grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig(f'{save_dir}/training_history.png', dpi=300, bbox_inches='tight')
+    print(f"✓ Training history saved to {save_dir}/training_history.png")
 
 
 if __name__ == "__main__":
-    TRAIN_CSV = "data/merge/train_processed.csv"
-    TEST_CSV  = "data/merge/test_processed.csv"
-    # Set random seed
+    # Set random seeds
     torch.manual_seed(42)
     np.random.seed(42)
     
     # Argument parser
-    parser = argparse.ArgumentParser(description='Train Hybrid CNN-DeepFM on IEEE-CIS Fraud Detection')
-    parser.add_argument('--train_csv', type=str, default='D:/project/data/merge/train_processed.csv', help='Path to training CSV')
-    parser.add_argument('--test_csv', type=str, default='D:/project/data/merge/test_processed.csv',  help='Path to test CSV')
-    parser.add_argument('--output', type=str, default='submission.csv', help='Output submission file')
-    parser.add_argument('--batch_size', type=int, default=256, help='Batch size')
-    parser.add_argument('--epochs', type=int, default=100, help='Number of epochs')
-    parser.add_argument('--lr', type=float, default=1e-3, help='Learning rate')
-    parser.add_argument('--val_split', type=float, default=0.2, help='Validation split ratio')
-    parser.add_argument('--use_pos_weight', action='store_true', help='Use pos_weight for imbalanced data')
-    parser.add_argument('--mode', type=str, default='train', choices=['train', 'predict', 'train_and_predict'], help='Mode: train, predict, or train_and_predict')
-    parser.add_argument('--checkpoint', type=str, default=None, help='Checkpoint path for prediction')
-    parser.add_argument('--model_save_path', type=str, default='best_fraud_model.pth', help='Path to save best model')
+    parser = argparse.ArgumentParser(
+        description='Fraud Detection with Hybrid CNN-DeepFM'
+    )
+    parser.add_argument('--train_csv', type=str, default='train_processed.csv',
+                       help='Path to training CSV')
+    parser.add_argument('--test_csv', type=str, default='test_processed.csv',
+                       help='Path to test CSV')
+    parser.add_argument('--output', type=str, default='submission.csv',
+                       help='Output submission file')
+    parser.add_argument('--batch_size', type=int, default=256,
+                       help='Batch size')
+    parser.add_argument('--epochs', type=int, default=100,
+                       help='Number of epochs')
+    parser.add_argument('--lr', type=float, default=1e-3,
+                       help='Learning rate')
+    parser.add_argument('--val_split', type=float, default=0.2,
+                       help='Validation split ratio')
+    parser.add_argument('--use_pos_weight', action='store_true',
+                       help='Use pos_weight for imbalanced data')
+    parser.add_argument('--mode', type=str, default='train',
+                       choices=['train', 'predict', 'train_and_predict'],
+                       help='Mode: train, predict, or train_and_predict')
+    parser.add_argument('--checkpoint', type=str, default=None,
+                       help='Checkpoint path for prediction')
+    parser.add_argument('--model_save_path', type=str, default='best_fraud_model.pth',
+                       help='Path to save best model')
+    parser.add_argument('--results_dir', type=str, default='./results',
+                       help='Directory to save results')
     
     args = parser.parse_args()
     
     DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
     
-    print("=" * 60)
-    print("IEEE-CIS Fraud Detection: Hybrid CNN-DeepFM")
-    print("=" * 60)
+    print("\n" + "="*70)
+    print("🔍 IEEE-CIS FRAUD DETECTION: Hybrid CNN-DeepFM")
+    print("="*70)
     print(f"Device: {DEVICE}")
     print(f"Mode: {args.mode}")
     print(f"Train CSV: {args.train_csv}")
     print(f"Test CSV: {args.test_csv}")
-    print()
+    print("="*70 + "\n")
     
     if args.mode in ['train', 'train_and_predict']:
-        # Load training data
-        print("Loading training data...")
-        full_dataset = IEEEFraudDataset(args.train_csv, target_col='isFraud')
+        # ========== LOAD TRAINING DATA ==========
+        print("📂 Loading training data...")
+        full_dataset = IEEEFraudDataset(args.train_csv, target_col='isFraud', normalize=True)
         
-        # Get number of features
         n_features = full_dataset.X.shape[1]
-        print(f"Number of features: {n_features}")
+        print(f"📊 Number of features: {n_features}\n")
         
         # Split into train/val
         train_size = int((1 - args.val_split) * len(full_dataset))
@@ -370,9 +553,8 @@ if __name__ == "__main__":
             generator=torch.Generator().manual_seed(42)
         )
         
-        print(f"Train samples: {len(train_dataset)}")
-        print(f"Val samples: {len(val_dataset)}")
-        print()
+        print(f"📈 Train samples: {len(train_dataset)}")
+        print(f"📉 Val samples: {len(val_dataset)}\n")
         
         # Create dataloaders
         train_loader = DataLoader(
@@ -396,31 +578,38 @@ if __name__ == "__main__":
             n_pos = full_dataset.y.sum().item()
             n_neg = len(full_dataset.y) - n_pos
             pos_weight = n_neg / n_pos if n_pos > 0 else 1.0
-            print(f"Calculated pos_weight: {pos_weight:.2f} (neg/pos = {n_neg}/{n_pos})")
+            print(f"⚖️  Pos Weight: {pos_weight:.2f} (to balance {n_neg} vs {n_pos})\n")
         
-        # Create model
-        print("\nBuilding Hybrid CNN-DeepFM model...")
-        model = HybridCNNDeepFM(tabular_dim=n_features,embed_dim=64,conv_channels=128,kernel_size=3,
+        # ========== BUILD MODEL ==========
+        print("🏗️  Building Hybrid CNN-DeepFM model...")
+        model = HybridCNNDeepFM(
+            tabular_dim=n_features,
+            embed_dim=64,
+            conv_channels=128,
+            kernel_size=3,
             bilinear_rank=64,
             bilinear_out_dim=256,
             seq_length=10,
             cnn_dropout=0.3,
-            num_classes=2,  
+            num_classes=2,
             deepfm_embed_dim=16,
             deepfm_hidden=[256, 128, 64],
-            deepfm_dropout=0.2,freeze_cnn=False,
+            deepfm_dropout=0.2,
+            freeze_cnn=False,
         )
         
         total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-        print(f"Total trainable parameters: {total_params:,}")
-        print()
+        print(f"✓ Total trainable parameters: {total_params:,}\n")
         
-        # Create trainer
-        trainer = Trainer(model=model,device=DEVICE,learning_rate=args.lr,weight_decay=1e-5,pos_weight=pos_weight)
-        
-        # Train model
-        print("Starting training...")
-        print("=" * 60)
+        # ========== TRAINING ==========
+        print("🚀 Starting training...\n")
+        trainer = FraudDetectionTrainer(
+            model=model,
+            device=DEVICE,
+            learning_rate=args.lr,
+            weight_decay=1e-5,
+            pos_weight=pos_weight
+        )
         
         history = trainer.fit(
             train_loader=train_loader,
@@ -430,28 +619,26 @@ if __name__ == "__main__":
             save_path=args.model_save_path,
         )
         
-        print("\n" + "=" * 60)
-        print("Training completed!")
-        print("=" * 60)
+        # Plot training history
+        plot_training_history(history, save_dir=args.results_dir)
         
-        # Final evaluation
-        print("\nFinal evaluation on validation set:")
-        final_metrics = trainer.evaluate(val_loader)
-        print(f"Validation Loss: {final_metrics['loss']:.4f}")
-        print(f"Validation Accuracy: {final_metrics['accuracy']:.2f}%")
+        # Save detailed metrics
+        trainer.save_best_metrics(val_loader, save_dir=args.results_dir)
         
-        # If train_and_predict mode, continue to prediction
+        print("\n" + "="*70)
+        print("✅ TRAINING COMPLETED!")
+        print("="*70 + "\n")
+        
+        # ========== PREDICTION ==========
         if args.mode == 'train_and_predict':
-            print("\n" + "=" * 60)
-            print("Starting prediction on test set...")
-            print("=" * 60)
+            print("🔮 Starting prediction on test set...\n")
             
             # Load best model
             trainer.load_checkpoint(args.model_save_path)
             
             # Load test data
-            print("\nLoading test data...")
-            test_dataset = IEEEFraudDataset(args.test_csv, target_col='isFraud')
+            print("📂 Loading test data...")
+            test_dataset = IEEEFraudDataset(args.test_csv, target_col='isFraud', normalize=True)
             
             test_loader = DataLoader(
                 test_dataset,
@@ -462,37 +649,45 @@ if __name__ == "__main__":
             )
             
             # Make predictions
-            print("\nMaking predictions on test set...")
-            predictions_proba = trainer.predict(test_loader, return_proba=True)
+            print("🎯 Making predictions...")
+            predictions, probabilities = trainer.predict(test_loader)
             
             # Create submission file
-            print(f"\nCreating submission file: {args.output}")
+            print(f"\n💾 Creating submission file: {args.output}")
             test_df = pd.read_csv(args.test_csv)
             
             if 'TransactionID' in test_df.columns:
                 submission_df = pd.DataFrame({
                     'TransactionID': test_df['TransactionID'],
-                    'isFraud': predictions_proba
+                    'isFraud': probabilities
                 })
             else:
                 submission_df = pd.DataFrame({
-                    'TransactionID': range(len(predictions_proba)),
-                    'isFraud': predictions_proba
+                    'TransactionID': range(len(probabilities)),
+                    'isFraud': probabilities
                 })
             
             submission_df.to_csv(args.output, index=False)
-            print(f"✓ Submission saved to {args.output}")
-            print(f"✓ Number of predictions: {len(submission_df)}")
-            print(f"✓ Mean prediction: {predictions_proba.mean():.4f}")
-            print(f"✓ Predictions > 0.5: {(predictions_proba > 0.5).sum()} ({100*(predictions_proba > 0.5).sum()/len(predictions_proba):.2f}%)")
+            
+            # Print statistics
+            print(f"\n{'='*60}")
+            print("📊 PREDICTION STATISTICS")
+            print(f"{'='*60}")
+            print(f"✓ Total predictions: {len(submission_df)}")
+            print(f"✓ Mean fraud probability: {probabilities.mean():.4f}")
+            print(f"✓ Predictions > 0.5: {(probabilities > 0.5).sum()} ({100*(probabilities > 0.5).sum()/len(probabilities):.2f}%)")
+            print(f"✓ Predictions > 0.3: {(probabilities > 0.3).sum()} ({100*(probabilities > 0.3).sum()/len(probabilities):.2f}%)")
+            print(f"✓ Predictions > 0.7: {(probabilities > 0.7).sum()} ({100*(probabilities > 0.7).sum()/len(probabilities):.2f}%)")
+            print(f"✓ Saved to: {args.output}")
+            print(f"{'='*60}\n")
     
     elif args.mode == 'predict':
         if args.checkpoint is None:
-            raise ValueError("--checkpoint is required for prediction mode")
+            raise ValueError("❌ --checkpoint is required for prediction mode")
         
         # Load test data
-        print("Loading test data...")
-        test_dataset = IEEEFraudDataset(args.test_csv, target_col='isFraud')
+        print("📂 Loading test data...")
+        test_dataset = IEEEFraudDataset(args.test_csv, target_col='isFraud', normalize=True)
         
         n_features = test_dataset.X.shape[1]
         
@@ -505,7 +700,7 @@ if __name__ == "__main__":
         )
         
         # Create model
-        print("Building model...")
+        print("🏗️  Building model...")
         model = HybridCNNDeepFM(
             tabular_dim=n_features,
             embed_dim=64,
@@ -523,33 +718,38 @@ if __name__ == "__main__":
         )
         
         # Create trainer and load checkpoint
-        trainer = Trainer(model=model, device=DEVICE)
+        trainer = FraudDetectionTrainer(model=model, device=DEVICE)
         trainer.load_checkpoint(args.checkpoint)
         
         # Make predictions
-        print("\nMaking predictions...")
-        predictions_proba = trainer.predict(test_loader, return_proba=True)
+        print("\n🎯 Making predictions...")
+        predictions, probabilities = trainer.predict(test_loader)
         
         # Create submission file
-        print(f"\nCreating submission file: {args.output}")
-        
-        # Load original test CSV to get TransactionID if available
+        print(f"\n💾 Creating submission file: {args.output}")
         test_df = pd.read_csv(args.test_csv)
         
         if 'TransactionID' in test_df.columns:
             submission_df = pd.DataFrame({
                 'TransactionID': test_df['TransactionID'],
-                'isFraud': predictions_proba
+                'isFraud': probabilities
             })
         else:
-            # If no TransactionID, create sequential IDs
             submission_df = pd.DataFrame({
-                'TransactionID': range(len(predictions_proba)),
-                'isFraud': predictions_proba
+                'TransactionID': range(len(probabilities)),
+                'isFraud': probabilities
             })
         
         submission_df.to_csv(args.output, index=False)
-        print(f"✓ Submission saved to {args.output}")
-        print(f"✓ Number of predictions: {len(submission_df)}")
-        print(f"✓ Mean prediction: {predictions_proba.mean():.4f}")
-        print(f"✓ Predictions > 0.5: {(predictions_proba > 0.5).sum()} ({100*(predictions_proba > 0.5).sum()/len(predictions_proba):.2f}%)")
+        
+        # Print statistics
+        print(f"\n{'='*60}")
+        print("📊 PREDICTION STATISTICS")
+        print(f"{'='*60}")
+        print(f"✓ Total predictions: {len(submission_df)}")
+        print(f"✓ Mean fraud probability: {probabilities.mean():.4f}")
+        print(f"✓ Predictions > 0.5: {(probabilities > 0.5).sum()} ({100*(probabilities > 0.5).sum()/len(probabilities):.2f}%)")
+        print(f"✓ Predictions > 0.3: {(probabilities > 0.3).sum()} ({100*(probabilities > 0.3).sum()/len(probabilities):.2f}%)")
+        print(f"✓ Predictions > 0.7: {(probabilities > 0.7).sum()} ({100*(probabilities > 0.7).sum()/len(probabilities):.2f}%)")
+        print(f"✓ Saved to: {args.output}")
+        print(f"{'='*60}\n")
