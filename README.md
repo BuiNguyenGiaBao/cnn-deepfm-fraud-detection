@@ -164,5 +164,4 @@ This study demonstrates that a Hybrid CNN–DeepFM architecture can effectively 
 * Recent empirical studies on CNNs for tabular data.
 
 
-Bạn muốn dùng README này cho **báo cáo môn học**, **đồ án**, hay **paper draft**?
 
